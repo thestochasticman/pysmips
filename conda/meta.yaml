@@ -1,0 +1,41 @@
+{% set version = "0.1.0" %}
+
+package:
+  name: pysmips
+  version: {{ version }}
+
+source:
+  path: ..
+
+build:
+  noarch: python
+  number: 0
+  script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+
+requirements:
+  host:
+    - python >=3.11
+    - pip
+    - setuptools >=61
+    - wheel
+  run:
+    - python >=3.11
+    - troi-core
+    - attrs
+    - typing_extensions
+    - numpy
+    - pandas
+    - rasterio
+    - xarray
+    - zarr >=3
+
+test:
+  imports:
+    - pysmips
+    - pysmips.grid
+
+about:
+  home: https://github.com/thestochasticman/pysmips
+  license: MIT
+  license_file: LICENSE
+  summary: Cached SMIPS daily soil-moisture cubes for Australia (one download per pixel-day)

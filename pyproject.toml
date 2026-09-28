@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysmips"
+version = "0.1.0"
+description = "Cached SMIPS daily soil-moisture cubes for Australia — download once per pixel-day, never twice"
+readme = "README.md"
+authors = [
+  { name = "Borevitz Lab, Australian National University" },
+  { name = "Yasar Adeel Ansari", email = "u6737670@anu.edu.au" },
+]
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = [
+  "smips",
+  "soil-moisture",
+  "australia",
+  "tern",
+  "csiro",
+  "hydrology",
+  "geospatial",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Hydrology",
+]
+# The geospatial stack (rasterio, xarray, zarr) is provided by conda via
+# environment.yml; it is declared here too so a plain pip install works.
+dependencies = [
+  "troi-core>=0.1.1",
+  "attrs",
+  "typing_extensions",
+  "numpy",
+  "pandas",
+  "xarray",
+  "zarr>=3",
+  "rasterio",
+]
+
+[project.urls]
+Homepage = "https://github.com/thestochasticman/pysmips"
+Repository = "https://github.com/thestochasticman/pysmips"
+Issues = "https://github.com/thestochasticman/pysmips/issues"
+
+[tool.setuptools.packages.find]
+include = ["pysmips", "pysmips.*"]

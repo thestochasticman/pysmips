@@ -1,0 +1,25 @@
+# Augments (or creates) the shared troi conda environment with
+# pysmips's stack:
+#
+#   conda env update -n troi -f environment.yml
+#   conda activate troi
+#   pip install -e ../troi && pip install -e .
+#
+# Never use --prune: the env is shared across lab repos.
+name: troi
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  # shared core (troi)
+  - attrs
+  - tabulate
+  - typing_extensions
+  # pysmips
+  - numpy
+  - pandas
+  - rasterio
+  - xarray
+  - zarr>=3
