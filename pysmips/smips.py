@@ -31,11 +31,6 @@ class SMIPS:
 
     base_url: str = 'https://data.tern.org.au/model-derived/smips/v1_0'
 
-    # Days younger than this may simply not be published yet: a 404 for
-    # them is not recorded as absent, so the next fill retries. Older
-    # 404s are genuine holes and are recorded so they are never re-asked.
-    publish_lag_days: int = 30
-
     products = {
         'totalbucket': ('totalbucket', 'smips_totalbucket_mm', 'mm', date(2005, 1, 1)),
         'smindex':     ('SMindex',     'smips_smi_perc',       'fraction', date(2005, 1, 1)),

@@ -14,7 +14,7 @@ everything already fetched. Part of the
 
 ```
 {data_root}/smips_store/
-├── index.db       # SQLite: populated (product, day, chunk) cells + upstream holes
+├── index.db       # SQLite: fetched (product, day, chunk) cells
 └── smips.zarr/
     ├── totalbucket   # one sparse (time, y, x) array per product
     └── smindex ...
@@ -35,10 +35,11 @@ everything already fetched. Part of the
   share the block read.
 - Reads return the **exact AOI window** (not whole chunks — a SMIPS chunk
   is ~130 km across) as an `xarray.Dataset` on `(time, lat, lon)`.
-- A day the datastore does not hold (HTTP 404) is recorded as *absent*
-  once it is older than `SMIPS.publish_lag_days` (30) and reads as NaN;
-  a younger 404 is "not published yet" and is retried next time. Any
-  other failure propagates rather than poisoning the store.
+- A day the datastore does not hold (HTTP 404 — in practice the two or
+  three most recent, not yet published) is simply not fetched: nothing
+  is recorded, it reads as NaN, and the next fill asks again. Any other
+  failure (a 401 from a stale key, a timeout, a 5xx) raises rather than
+  being written into the store as silent NaN.
 - Pixel reads require a TERN API key (listings are public) — set
   `tern_api_key` in `~/.config/Troi.json`, `TROI_TERN_KEY`, or pass
   `api_key=` per call. Keys are free from <https://account.tern.org.au/>.
@@ -75,7 +76,6 @@ ds = store.get_ds(bbox, date(2020, 1, 1), date(2020, 12, 31),
                   products=('totalbucket', 'smindex', 'bucket1'))
 
 store.fill(bbox, date(2020, 1, 1), date(2020, 12, 31))   # → 0: already local
-store.absent_days('totalbucket', date(2020, 1, 1), date(2020, 12, 31))  # upstream holes
 ```
 
 Pass `log=print` to `fill`/`get_ds` for one progress line per 64-day
@@ -131,8 +131,7 @@ Package design (shared across the lab's packages — no inheritance,
 composition only):
 
 - **`Troi`** (from `troi`) — identity: what region, what dates.
-- **`SMIPS`** (`pysmips.smips`) — config: endpoint, product catalog,
-  publication lag.
+- **`SMIPS`** (`pysmips.smips`) — config: endpoint, product catalog.
 - **`Paths`** (`pysmips.paths`) — derived locations of the store for a
   given `Config`.
 - **`grid`** — the fixed SMIPS lattice, chunk and time-axis math (pure,

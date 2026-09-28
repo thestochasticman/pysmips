@@ -1,7 +1,7 @@
 """Fetch the SMIPS cube for a troi -- via the machine-wide store.
 
 Thin compatibility wrapper: the heavy lifting (ledger diffing,
-concurrent windowed COG reads, absent-day bookkeeping) lives in
+concurrent windowed COG reads, missing-day handling) lives in
 :class:`pysmips.store.Store`. Kept as a module so a familiar
 ``download_smips(troi)`` entry point exists.
 """

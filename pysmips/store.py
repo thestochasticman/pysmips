@@ -5,7 +5,7 @@ sparse Zarr store, one ``(time, y, x)`` array per product on the SMIPS
 national ~1 km grid (:mod:`pysmips.grid`):
 
     {config.tmp_dir}/smips_store/
-    ├── index.db       # SQLite ledger: populated (product, day, chunk) cells
+    ├── index.db       # SQLite ledger: fetched (product, day, chunk) cells
     └── smips.zarr/
         ├── totalbucket   # sparse (time, y, x); only written chunks exist
         └── smindex ...
@@ -17,11 +17,11 @@ per missing chunk, never a resample -- then reads the exact AOI window.
 Days are fetched concurrently; Zarr writes happen once per (time-chunk,
 spatial-chunk) block on the calling thread.
 
-A day the datastore does not have (HTTP 404) is recorded as ``absent``
-once it is older than ``SMIPS.publish_lag_days``, so it is never
-re-requested and reads as NaN; a younger 404 is treated as "not
-published yet" and retried next time. Any other failure propagates --
-recording it would poison the store.
+A day the datastore does not have (HTTP 404 -- in practice only the two
+or three most recent, not yet published) is simply not fetched: nothing
+is recorded, it reads as NaN, and the next fill asks again. Any other
+failure (401 from a stale key, timeout, 5xx) propagates -- recording it
+as done would poison the store with silent NaN.
 
 Every COG opened is checked against the hardcoded grid; a mismatch
 raises rather than writes. Pixel reads require a TERN API key
@@ -49,7 +49,6 @@ CREATE TABLE IF NOT EXISTS cells (
     day        TEXT NOT NULL,
     cy         INTEGER NOT NULL,
     cx         INTEGER NOT NULL,
-    status     TEXT NOT NULL,          -- 'ok' | 'absent'
     written_at TEXT NOT NULL,
     PRIMARY KEY (product, day, cy, cx)
 ) WITHOUT ROWID;
@@ -57,8 +56,7 @@ CREATE INDEX IF NOT EXISTS cells_by_product_day ON cells(product, day);
 """
 
 DEFAULT_PRODUCTS = ('totalbucket',)
-_ABSENT = object()        # sentinel: the day's COG does not exist upstream
-_DAY = timedelta(days=1)
+_MISSING = object()       # sentinel: the day's COG is not on the datastore (404)
 
 
 class GridMismatch(RuntimeError):
@@ -130,10 +128,11 @@ class Store:
         covering ``bbox`` x ``[start, end]`` is populated.
 
         Troi-agnostic. Returns the number of cells actually downloaded --
-        0 means the request was already fully covered (or entirely absent
-        upstream) and no network was touched. Days before a product's
-        first publication are skipped silently. ``log`` is an optional
-        callable receiving one progress line per time chunk.
+        0 means the request was already fully covered and no network was
+        touched. Days before a product's first publication are skipped
+        without a request; days the datastore does not hold are skipped
+        after one. ``log`` is an optional callable receiving one progress
+        line per time chunk.
         """
         for p in products:
             s.smips.check(p)
@@ -184,33 +183,30 @@ class Store:
             got = dict(zip(days, ex.map(
                 lambda d: s._fetch_day(product, d, missing[d], api_key), days)))
 
-        cutoff = date.today() - timedelta(days=s.smips.publish_lag_days)
         now = datetime.now(timezone.utc).isoformat()
         rows, fetched = [], 0
-        touched = {c for d in days for c in missing[d] if got[d] is not _ABSENT}
+        touched = {c for d in days for c in missing[d] if got[d] is not _MISSING}
         for cy, cx in sorted(touched):
             r0, r1, c0, c1 = grid.chunk_window(cy, cx)
             block = arr[t0:t1, r0:r1, c0:c1]
             for d in days:
                 data = got[d]
-                if data is _ABSENT or (cy, cx) not in data:
+                if data is _MISSING or (cy, cx) not in data:
                     continue
                 block[grid.day_index(d) - t0] = data[(cy, cx)]
-                rows.append((product, str(d), cy, cx, 'ok', now))
+                rows.append((product, str(d), cy, cx, now))
                 fetched += 1
             arr[t0:t1, r0:r1, c0:c1] = block
-        for d in days:
-            if got[d] is _ABSENT and d <= cutoff:
-                rows.extend((product, str(d), cy, cx, 'absent', now) for cy, cx in missing[d])
         with db:
             db.executemany(
-                'INSERT OR REPLACE INTO cells (product, day, cy, cx, status, written_at) '
-                'VALUES (?, ?, ?, ?, ?, ?)', rows)
+                'INSERT OR REPLACE INTO cells (product, day, cy, cx, written_at) '
+                'VALUES (?, ?, ?, ?, ?)', rows)
         return fetched
 
     def _fetch_day(s, product: str, day: date, chunks: list, api_key: str):
         """One remote COG open + one windowed read per requested chunk.
-        Returns ``{(cy, cx): float32 array}`` or ``_ABSENT`` on a 404."""
+        Returns ``{(cy, cx): float32 array}``, or ``_MISSING`` on a 404 --
+        the only failure that means "no data" rather than "try again"."""
         import rasterio
         from rasterio.windows import Window
         url = s.smips.url(product, day)
@@ -230,7 +226,7 @@ class Store:
                 return out
         except rasterio.errors.RasterioIOError as e:
             if '404' in str(e):
-                return _ABSENT
+                return _MISSING
             raise
 
     @staticmethod
@@ -262,7 +258,8 @@ class Store:
         Returns:
             xarray.Dataset with dims ``(time, lat, lon)`` -- the exact AOI
             window on the native grid -- and one variable per product.
-            Days absent upstream (or before a product's first day) are NaN.
+            Days the datastore does not hold (or before a product's first
+            day) are NaN.
         """
         s.fill(bbox, start, end, products=products, api_key=api_key, log=log)
         window = grid.window_for_bbox(bbox)
@@ -284,19 +281,6 @@ class Store:
             attrs={'crs': 'EPSG:4326', 'source': 'SMIPS v1.0 (CSIRO/TERN)',
                    'url': s.smips.base_url},
         )
-
-    def absent_days(s, product: str, start: date, end: date) -> list[date]:
-        """Days in ``[start, end]`` the datastore has been found not to
-        hold for ``product`` (any chunk recorded ``absent``)."""
-        db = s._db()
-        try:
-            rows = db.execute(
-                "SELECT DISTINCT day FROM cells WHERE product = ? AND status = 'absent' "
-                'AND day BETWEEN ? AND ? ORDER BY day', (product, str(start), str(end)),
-            ).fetchall()
-        finally:
-            db.close()
-        return [date.fromisoformat(r[0]) for r in rows]
 
     # -- Troi adapters (the reproducibility layer speaks Troi) ----------
 
@@ -324,10 +308,9 @@ def _tmp_store() -> Store:
 
 
 def _prime(store: Store, product: str, bbox, start: date, end: date,
-           value: float = 1.0, status: str = 'ok'):
+           value: float = 1.0):
     """Populate bbox's chunks for every day in [start, end] directly,
-    bypassing the network. ``status='absent'`` records the days as
-    upstream holes and writes nothing."""
+    bypassing the network."""
     arr = store._array(product)
     window = grid.window_for_bbox(bbox)
     days = [start + timedelta(days=k) for k in range((end - start).days + 1)]
@@ -335,15 +318,13 @@ def _prime(store: Store, product: str, bbox, start: date, end: date,
     for cy, cx in grid.chunks_in_window(window):
         r0, r1, c0, c1 = grid.chunk_window(cy, cx)
         for d in days:
-            if status == 'ok':
-                i = grid.day_index(d)
-                arr[i, r0:r1, c0:c1] = value + i * 0.0   # flat field per day
-            rows.append((product, str(d), cy, cx, status, 'synthetic'))
+            arr[grid.day_index(d), r0:r1, c0:c1] = value        # flat field per day
+            rows.append((product, str(d), cy, cx, 'synthetic'))
     db = store._db()
     with db:
         db.executemany(
-            'INSERT OR REPLACE INTO cells (product, day, cy, cx, status, written_at) '
-            'VALUES (?, ?, ?, ?, ?, ?)', rows)
+            'INSERT OR REPLACE INTO cells (product, day, cy, cx, written_at) '
+            'VALUES (?, ?, ?, ?, ?)', rows)
     db.close()
 
 
@@ -366,17 +347,36 @@ def test_fill_skips_populated_cells():
     return store.fill(_TEST_BBOX, date(2010, 1, 5), date(2010, 1, 20)) == 0
 
 
-def test_absent_days_are_not_refetched_and_read_nan():
-    store = _tmp_store()
+def test_missing_day_is_skipped_not_recorded():
+    """A 404 day (simulated) writes nothing to the ledger, reads as NaN,
+    and is asked for again on the next fill; fetched days are recorded."""
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix='pysmips_store_test_')
+    store = Store(config=Config(out_dir=tmpdir, tmp_dir=tmpdir, tern_api_key='synthetic'))
     _prime(store, 'totalbucket', _TEST_BBOX, date(2010, 1, 1), date(2010, 1, 2), 5.0)
-    _prime(store, 'totalbucket', _TEST_BBOX, date(2010, 1, 3), date(2010, 1, 3), status='absent')
-    n = store.fill(_TEST_BBOX, date(2010, 1, 1), date(2010, 1, 3))      # no key, no network
-    ds = store.get_ds(_TEST_BBOX, date(2010, 1, 1), date(2010, 1, 3))
+    calls = []
+
+    def fake_fetch(self, product, day, chunks, api_key):
+        calls.append(day)
+        return _MISSING if day == date(2010, 1, 3) else {
+            c: np.full((grid.CHUNK, grid.CHUNK), 7.0, 'float32') for c in chunks}
+
+    real = Store._fetch_day
+    setattr(Store, '_fetch_day', fake_fetch)
+    try:
+        n1 = store.fill(_TEST_BBOX, date(2010, 1, 1), date(2010, 1, 4))
+        n2 = store.fill(_TEST_BBOX, date(2010, 1, 1), date(2010, 1, 4))
+        ds = store.get_ds(_TEST_BBOX, date(2010, 1, 1), date(2010, 1, 4))   # re-asks Jan 3 again
+    finally:
+        setattr(Store, '_fetch_day', real)
+    nchunks = len(grid.chunks_in_window(grid.window_for_bbox(_TEST_BBOX)))
     return (
-        n == 0
+        n1 == nchunks                                    # only Jan 4 was fetched
+        and n2 == 0                                      # ...and Jan 3 re-asked but not counted
+        and calls == [date(2010, 1, 3), date(2010, 1, 4), date(2010, 1, 3), date(2010, 1, 3)]
         and np.isnan(ds['totalbucket'][2]).all()
+        and float(ds['totalbucket'][3, 0, 0]) == 7.0
         and float(ds['totalbucket'][1, 0, 0]) == 5.0
-        and store.absent_days('totalbucket', date(2010, 1, 1), date(2010, 1, 31)) == [date(2010, 1, 3)]
     )
 
 
@@ -431,7 +431,7 @@ def test():
     return all([
         test_synthetic_write_read_roundtrip(),
         test_fill_skips_populated_cells(),
-        test_absent_days_are_not_refetched_and_read_nan(),
+        test_missing_day_is_skipped_not_recorded(),
         test_products_are_independent(),
         test_pre_publication_days_need_no_network(),
         test_unknown_product_raises(),
