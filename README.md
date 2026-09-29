@@ -40,6 +40,9 @@ everything already fetched. Part of the
   is recorded, it reads as NaN, and the next fill asks again. Any other
   failure (a 401 from a stale key, a timeout, a 5xx) raises rather than
   being written into the store as silent NaN.
+- Asking again costs one request per unpublished day per product, on
+  every `fill`/`get_ds` whose range includes that day. A filled range
+  whose days are all published is served from the ledger alone.
 - Pixel reads require a TERN API key (listings are public) — set
   `tern_api_key` in `~/.config/Troi.json`, `TROI_TERN_KEY`, or pass
   `api_key=` per call. Keys are free from <https://account.tern.org.au/>.
@@ -75,7 +78,7 @@ ds['totalbucket']                          # (time, lat, lon) DataArray, mm
 ds = store.get_ds(bbox, date(2020, 1, 1), date(2020, 12, 31),
                   products=('totalbucket', 'smindex', 'bucket1'))
 
-store.fill(bbox, date(2020, 1, 1), date(2020, 12, 31))   # → 0: already local
+store.fill(bbox, date(2020, 1, 1), date(2020, 12, 31))   # → 0: nothing left to download
 ```
 
 Pass `log=print` to `fill`/`get_ds` for one progress line per 64-day
@@ -97,7 +100,8 @@ Live measurements against the TERN datastore, `workers=8`:
 |---|---|---|
 | Cold fill — Kyeamba (32 × 42 px), 7 days | 14 cells | 2.1 s |
 | Cold fill — Murrumbidgee envelope (581 × 251 px, 18 chunks/day), one year | 6 588 cells | 44 s (≈ 8 days/s) |
-| Same request again | nothing | **0.03 s** |
+| Same request again, all days published | nothing | **0.03 s** |
+| Same request again, range includes unpublished days | nothing | one request per such day per product |
 | Sub-AOI inside a filled envelope, any dates covered | nothing | **0.01 s** |
 | Read the envelope year (366 × 251 × 581) | — | 1.3 s |
 | Read a 20-year point series | — | ≈ 1 s |
@@ -105,8 +109,11 @@ Live measurements against the TERN datastore, `workers=8`:
 Store footprint: ≈ 340 MB per envelope-year of `totalbucket` (≈ 7 GB
 for the full 2005–2025 record of one product over an 82 000 km²
 catchment). A 20-year envelope fill is ≈ 15 min per product. Absolute
-times vary with network and TERN load; the zeros are the point — they
-are ledger lookups, no network involved.
+times vary with network and TERN load; the zeros are the point — when
+every day in the range is published they are ledger lookups, with no
+network and no API key involved. A range that reaches the last few
+days is the exception: each day TERN has not published yet is asked
+for again, which needs the network and a key.
 
 ## Install
 
@@ -118,6 +125,11 @@ pip install git+https://github.com/thestochasticman/pysmips.git
 
 Dependencies (the `troi-core` core from PyPI, plus rasterio / xarray /
 zarr ≥ 3) are declared in `pyproject.toml` and installed automatically.
+
+Upgrading from 0.1.0 needs no action: the first time 0.2.0 opens an
+existing store it keeps every fetched cell and forgets the days 0.1.0
+had marked absent, so they are asked for again. 0.2.0 removes
+`Store.absent_days()` and `SMIPS.publish_lag_days`.
 
 ### From source
 
