@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pysmips"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cached SMIPS daily soil-moisture cubes for Australia — download once per pixel-day, never twice"
 readme = "README.md"
 authors = [

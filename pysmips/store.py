@@ -27,6 +27,7 @@ Every COG opened is checked against the hardcoded grid; a mismatch
 raises rather than writes. Pixel reads require a TERN API key
 (``config.tern_api_key`` or the ``api_key`` argument).
 """
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
@@ -54,6 +55,8 @@ CREATE TABLE IF NOT EXISTS cells (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS cells_by_product_day ON cells(product, day);
 """
+_INSERT_CELL = ('INSERT OR REPLACE INTO cells (product, day, cy, cx, written_at) '
+                'VALUES (?, ?, ?, ?, ?)')
 
 DEFAULT_PRODUCTS = ('totalbucket',)
 _MISSING = object()       # sentinel: the day's COG is not on the datastore (404)
@@ -97,6 +100,10 @@ class Store:
         db = sqlite3.connect(s.paths.index_db)
         db.execute('PRAGMA journal_mode=WAL')
         db.executescript(_SCHEMA)
+        if any(r[1] == 'status' for r in db.execute('PRAGMA table_info(cells)')):
+            # 0.1.0 ledgers pinned 404 days as 'absent'; forget them, keep fetched cells.
+            db.executescript("DELETE FROM cells WHERE status = 'absent'; "
+                             'ALTER TABLE cells DROP COLUMN status;')
         return db
 
     def _api_key(s, api_key: str = None) -> str:
@@ -127,12 +134,12 @@ class Store:
         """Ensure every (day, chunk) cell of every requested product
         covering ``bbox`` x ``[start, end]`` is populated.
 
-        Troi-agnostic. Returns the number of cells actually downloaded --
-        0 means the request was already fully covered and no network was
-        touched. Days before a product's first publication are skipped
-        without a request; days the datastore does not hold are skipped
-        after one. ``log`` is an optional callable receiving one progress
-        line per time chunk.
+        Troi-agnostic. Returns the number of cells actually downloaded.
+        Days before a product's first publication are skipped without a
+        request; days the datastore does not hold are skipped after one
+        (and asked again next time), so 0 means every cell that exists
+        upstream was already local. ``log`` is an optional callable
+        receiving one progress line per time chunk.
         """
         for p in products:
             s.smips.check(p)
@@ -153,7 +160,8 @@ class Store:
                 missing = {}                     # day -> [chunks]
                 for i in range(i0, i1 + 1):
                     d = grid.date_of(i)
-                    need = [c for c in chunks if (str(d), *c) not in done]
+                    sd = str(d)
+                    need = [c for c in chunks if (sd, *c) not in done]
                     if need:
                         missing[d] = need
                 if not missing:
@@ -180,27 +188,25 @@ class Store:
         write each touched spatial chunk once and record the ledger."""
         t0, t1 = grid.tchunk_range(tc)
         with ThreadPoolExecutor(max_workers=s.workers) as ex:
-            got = dict(zip(days, ex.map(
-                lambda d: s._fetch_day(product, d, missing[d], api_key), days)))
+            got = {d: r for d, r in zip(days, ex.map(
+                lambda d: s._fetch_day(product, d, missing[d], api_key), days))
+                   if r is not _MISSING}                  # 404 days drop out here
 
         now = datetime.now(timezone.utc).isoformat()
         rows, fetched = [], 0
-        touched = {c for d in days for c in missing[d] if got[d] is not _MISSING}
+        touched = {c for d in got for c in missing[d]}
         for cy, cx in sorted(touched):
             r0, r1, c0, c1 = grid.chunk_window(cy, cx)
             block = arr[t0:t1, r0:r1, c0:c1]
-            for d in days:
-                data = got[d]
-                if data is _MISSING or (cy, cx) not in data:
+            for d, data in got.items():
+                if (cy, cx) not in data:
                     continue
                 block[grid.day_index(d) - t0] = data[(cy, cx)]
                 rows.append((product, str(d), cy, cx, now))
                 fetched += 1
             arr[t0:t1, r0:r1, c0:c1] = block
         with db:
-            db.executemany(
-                'INSERT OR REPLACE INTO cells (product, day, cy, cx, written_at) '
-                'VALUES (?, ?, ?, ?, ?)', rows)
+            db.executemany(_INSERT_CELL, rows)
         return fetched
 
     def _fetch_day(s, product: str, day: date, chunks: list, api_key: str):
@@ -225,7 +231,9 @@ class Store:
                     out[(cy, cx)] = data
                 return out
         except rasterio.errors.RasterioIOError as e:
-            if '404' in str(e):
+            # A standalone 404 ("HTTP response code: 404"), not the digits of
+            # a date inside the URL (…_20240404.tif) of some other failure.
+            if re.search(r'(?<!\d)404(?!\d)', str(e)):
                 return _MISSING
             raise
 
@@ -301,10 +309,10 @@ class Store:
 _TEST_BBOX = [147.30, -35.52, 147.62, -35.10]   # Kyeamba Creek
 
 
-def _tmp_store() -> Store:
+def _tmp_store(**config_kw) -> Store:
     import tempfile
     tmpdir = tempfile.mkdtemp(prefix='pysmips_store_test_')
-    return Store(config=Config(out_dir=tmpdir, tmp_dir=tmpdir))
+    return Store(config=Config(out_dir=tmpdir, tmp_dir=tmpdir, **config_kw))
 
 
 def _prime(store: Store, product: str, bbox, start: date, end: date,
@@ -322,9 +330,7 @@ def _prime(store: Store, product: str, bbox, start: date, end: date,
             rows.append((product, str(d), cy, cx, 'synthetic'))
     db = store._db()
     with db:
-        db.executemany(
-            'INSERT OR REPLACE INTO cells (product, day, cy, cx, written_at) '
-            'VALUES (?, ?, ?, ?, ?)', rows)
+        db.executemany(_INSERT_CELL, rows)
     db.close()
 
 
@@ -350,9 +356,7 @@ def test_fill_skips_populated_cells():
 def test_missing_day_is_skipped_not_recorded():
     """A 404 day (simulated) writes nothing to the ledger, reads as NaN,
     and is asked for again on the next fill; fetched days are recorded."""
-    import tempfile
-    tmpdir = tempfile.mkdtemp(prefix='pysmips_store_test_')
-    store = Store(config=Config(out_dir=tmpdir, tmp_dir=tmpdir, tern_api_key='synthetic'))
+    store = _tmp_store(tern_api_key='synthetic')
     _prime(store, 'totalbucket', _TEST_BBOX, date(2010, 1, 1), date(2010, 1, 2), 5.0)
     calls = []
 
@@ -373,11 +377,32 @@ def test_missing_day_is_skipped_not_recorded():
     return (
         n1 == nchunks                                    # only Jan 4 was fetched
         and n2 == 0                                      # ...and Jan 3 re-asked but not counted
-        and calls == [date(2010, 1, 3), date(2010, 1, 4), date(2010, 1, 3), date(2010, 1, 3)]
+        and sorted(calls[:2]) == [date(2010, 1, 3), date(2010, 1, 4)]   # concurrent: any order
+        and calls[2:] == [date(2010, 1, 3), date(2010, 1, 3)]
         and np.isnan(ds['totalbucket'][2]).all()
         and float(ds['totalbucket'][3, 0, 0]) == 7.0
         and float(ds['totalbucket'][1, 0, 0]) == 5.0
     )
+
+
+def test_v0_ledger_is_migrated():
+    """A 0.1.0 index.db (with a ``status`` column) keeps its fetched cells,
+    forgets its 'absent' ones so they are asked again, and accepts writes."""
+    store = _tmp_store()
+    old = sqlite3.connect(store.paths.index_db)
+    old.executescript("""
+        CREATE TABLE cells (product TEXT, day TEXT, cy INTEGER, cx INTEGER,
+            status TEXT NOT NULL, written_at TEXT, PRIMARY KEY (product, day, cy, cx));
+        INSERT INTO cells VALUES ('totalbucket', '2010-01-01', 1, 2, 'ok', 'old');
+        INSERT INTO cells VALUES ('totalbucket', '2010-01-02', 1, 2, 'absent', 'old');
+    """)
+    old.close()
+    db = store._db()
+    with db:
+        db.execute(_INSERT_CELL, ('totalbucket', '2010-01-03', 1, 2, 'new'))
+    rows = db.execute('SELECT day, written_at FROM cells ORDER BY day').fetchall()
+    db.close()
+    return rows == [('2010-01-01', 'old'), ('2010-01-03', 'new')]
 
 
 def test_products_are_independent():
@@ -432,6 +457,7 @@ def test():
         test_synthetic_write_read_roundtrip(),
         test_fill_skips_populated_cells(),
         test_missing_day_is_skipped_not_recorded(),
+        test_v0_ledger_is_migrated(),
         test_products_are_independent(),
         test_pre_publication_days_need_no_network(),
         test_unknown_product_raises(),

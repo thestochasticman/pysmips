@@ -10,7 +10,6 @@ from troi import Troi
 from pysmips.smips import SMIPS, defaultsmips
 from pysmips.store import DEFAULT_PRODUCTS
 
-
 def download_smips(troi: Troi, products=DEFAULT_PRODUCTS, api_key: str = None,
                    smips: SMIPS = defaultsmips, log=None) -> xr.Dataset:
     """Return the SMIPS ``(time, lat, lon)`` cube for ``troi``.
@@ -73,7 +72,6 @@ def test_live_fetch_and_dedup():
         return False
     print(f'  cold fill {fetched} cells / 7 days in {cold:.1f}s; store at {tmpdir}')
     return True
-
 
 def grid_chunks(bbox):
     from pysmips import grid
