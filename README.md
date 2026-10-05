@@ -13,12 +13,23 @@ everything already fetched. Part of the
 ## How it works
 
 ```
-{data_root}/smips_store/
-├── index.db       # SQLite: fetched (product, day, chunk) cells
-└── smips.zarr/
-    ├── totalbucket   # one sparse (time, y, x) array per product
-    └── smindex ...
+{tmp_dir}/smips_store/
+├── smips.zarr/
+│   ├── totalbucket   # one sparse (time, y, x) array per product
+│   └── smindex ...
+├── ledger/           # one JSON marker per written (product, time-chunk, chunk) block
+│   └── totalbucket/00085/012_034.json      # {"days": "0110...1"}  one char per day
+├── absent/           # upstream 404s, dated, read only by gaps()
+│   └── totalbucket/2026/2026-10-04.json
+└── claims/           # cross-node mutex directories, present only during a write
 ```
+
+The ledger is files, not a database. This branch (`gadi`) runs as many
+PBS jobs on many Gadi nodes against one store on Lustre, where file
+locks are node-local and SQLite is unsafe; see
+[troi/docs/ledger.md](https://github.com/thestochasticman/troi/blob/gadi/docs/ledger.md).
+A marker is committed by atomic rename, and a block is written under a
+claim directory so two jobs never read-modify-write the same Zarr block.
 
 - SMIPS v1.0 sits on **one fixed grid** (4110 × 3474 px, ~0.01°,
   EPSG:4326) that has not changed since 2005-01-01, so the lattice is
@@ -43,9 +54,16 @@ everything already fetched. Part of the
 - Asking again costs one request per unpublished day per product, on
   every `fill`/`get_ds` whose range includes that day. A filled range
   whose days are all published is served from the ledger alone.
+- The 404 is also written under `absent/` with the time it was seen, so
+  `gaps()` can say *why* a day is empty. That record never suppresses a
+  fetch. `fill` clamps `end` to today, so no request is made for the future.
 - Pixel reads require a TERN API key (listings are public) — set
   `tern_api_key` in `~/.config/Troi.json`, `TROI_TERN_KEY`, or pass
   `api_key=` per call. Keys are free from <https://account.tern.org.au/>.
+- Nothing is ever resampled. `get_ds` returns native pixels with the
+  attrs `crs`, `transform` (six affine numbers of the returned window),
+  `nodata` and `native_res_m`, so a consumer can regrid reproducibly from
+  the dataset alone.
 
 ## Products
 
@@ -84,6 +102,23 @@ store.fill(bbox, date(2020, 1, 1), date(2020, 12, 31))   # → 0: nothing left t
 Pass `log=print` to `fill`/`get_ds` for one progress line per 64-day
 time chunk on long fills.
 
+### Is anything missing?
+
+```python
+report = store.gaps(bbox, date(2020, 1, 1), date.today())
+print(report.summary())
+# 1098/1100 units present
+#   absent_upstream: 2
+#   absent last checked 0..0 days ago
+report.complete        # True: nothing is never_fetched or claimed_in_progress
+```
+
+`gaps` enumerates the same (product, day, chunk) cells `fill` would and
+classifies each missing one: `never_fetched`, `absent_upstream` (last
+told 404, with age), `before_product_start`, `after_today`,
+`claimed_in_progress` (another job is writing that block now). It touches
+no network.
+
 Pipelines that speak the shared `troi.Troi` use the adapters:
 
 ```python
@@ -110,7 +145,7 @@ Store footprint: ≈ 340 MB per envelope-year of `totalbucket` (≈ 7 GB
 for the full 2005–2025 record of one product over an 82 000 km²
 catchment). A 20-year envelope fill is ≈ 15 min per product. Absolute
 times vary with network and TERN load; the zeros are the point — when
-every day in the range is published they are ledger lookups, with no
+every day in the range is published they are marker reads, with no
 network and no API key involved. A range that reaches the last few
 days is the exception: each day TERN has not published yet is asked
 for again, which needs the network and a key.
@@ -120,16 +155,15 @@ for again, which needs the network and a key.
 ### pip
 
 ```bash
-pip install git+https://github.com/thestochasticman/pysmips.git
+pip install git+https://github.com/thestochasticman/pysmips.git@gadi
 ```
 
 Dependencies (the `troi-core` core from PyPI, plus rasterio / xarray /
 zarr ≥ 3) are declared in `pyproject.toml` and installed automatically.
 
-Upgrading from 0.1.0 needs no action: the first time 0.2.0 opens an
-existing store it keeps every fetched cell and forgets the days 0.1.0
-had marked absent, so they are asked for again. 0.2.0 removes
-`Store.absent_days()` and `SMIPS.publish_lag_days`.
+The `gadi` branch (0.3.0+gadi) does not read the SQLite `index.db` of
+0.1.0/0.2.0 stores; point it at a fresh `tmp_dir`. `main` keeps the
+SQLite ledger for single-machine use.
 
 ### From source
 

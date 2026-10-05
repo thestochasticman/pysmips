@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pysmips"
-version = "0.2.0"
+version = "0.3.0+gadi"
 description = "Cached SMIPS daily soil-moisture cubes for Australia — download once per pixel-day, never twice"
 readme = "README.md"
 authors = [
@@ -35,7 +35,7 @@ classifiers = [
 # The geospatial stack (rasterio, xarray, zarr) is provided by conda via
 # environment.yml; it is declared here too so a plain pip install works.
 dependencies = [
-  "troi-core>=0.1.1",
+  "troi-core @ git+https://github.com/thestochasticman/troi.git@gadi",
   "attrs",
   "typing_extensions",
   "numpy",

@@ -16,9 +16,14 @@ class Paths:
     Attributes:
         config: The :class:`troi.Config` supplying the data root (and the
             TERN API key).
-        root: Store directory (``{config.tmp_dir}/smips_store``).
+        root: Store directory (``{config.tmp_dir}/smips_store``). Cross-node
+            claims live under ``{root}/claims`` (see :mod:`troi.ledger`).
         store: The sparse Zarr store -- one ``(time, y, x)`` array per product.
-        index_db: SQLite ledger of populated (product, day, chunk) cells.
+        ledger: Marker tree of populated blocks:
+            ``ledger/{product}/{tc:05d}/{cy:03d}_{cx:03d}.json`` holding a
+            0/1 string, one character per day of the time chunk.
+        absent: Marker tree of upstream 404s, for the ``gaps()`` audit only:
+            ``absent/{product}/{year}/{YYYY-MM-DD}.json``.
 
     Example:
         ```python
@@ -32,11 +37,13 @@ class Paths:
 
     root: str = field(init=False)
     store: str = field(init=False)
-    index_db: str = field(init=False)
+    ledger: str = field(init=False)
+    absent: str = field(init=False)
 
     root.default(lambda s: f'{s.config.tmp_dir}/smips_store')
     store.default(lambda s: f'{s.root}/smips.zarr')
-    index_db.default(lambda s: f'{s.root}/index.db')
+    ledger.default(lambda s: f'{s.root}/ledger')
+    absent.default(lambda s: f'{s.root}/absent')
 
 
 def test_paths_derive_from_config():
@@ -47,7 +54,8 @@ def test_paths_derive_from_config():
     return (
         paths.root == f'{tmpdir}/smips_store'
         and paths.store == f'{tmpdir}/smips_store/smips.zarr'
-        and paths.index_db == f'{tmpdir}/smips_store/index.db'
+        and paths.ledger == f'{tmpdir}/smips_store/ledger'
+        and paths.absent == f'{tmpdir}/smips_store/absent'
     )
 
 
