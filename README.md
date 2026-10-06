@@ -65,6 +65,76 @@ claim directory so two jobs never read-modify-write the same Zarr block.
   `nodata` and `native_res_m`, so a consumer can regrid reproducibly from
   the dataset alone.
 
+### The pieces
+
+```mermaid
+flowchart LR
+    subgraph root ["smips_store/"]
+        direction TB
+        Z[("smips.zarr/&lt;product&gt;<br/>(time, y, x) float32<br/>chunks of 64 days × 128 × 128 px")]
+        M["ledger/&lt;product&gt;/&lt;tc&gt;/&lt;cy&gt;_&lt;cx&gt;.json<br/>days: 0110…1 — one char per day of the chunk"]
+        A["absent/&lt;product&gt;/&lt;year&gt;/&lt;day&gt;.json<br/>status 404, checked_at"]
+        C["claims/&lt;product&gt;-&lt;tc&gt;-&lt;cy&gt;-&lt;cx&gt;/<br/>one per block being written"]
+    end
+    FILL(["fill"]) -->|"① claim every block of the time chunk"| C
+    FILL -->|"② fetch days · read block · write"| Z
+    FILL -->|"③ OR the day mask in"| M
+    FILL -.->|"404"| A
+    FILL -->|"④ release"| C
+    GET(["get_ds"]) --> FILL
+    GET -->|"exact AOI window + attrs"| Z
+    GAPS(["gaps"]) --> M
+    GAPS --> A
+    GAPS --> C
+```
+
+The unit of the ledger is one **block**: one product, one 64-day time
+chunk, one 128 × 128 px spatial chunk. A block is one Zarr chunk, and
+its marker says which of the 64 days are in it. The unit of fetching is
+smaller, one (day, chunk) window, so a block is read, updated and
+written back under a claim. Shared primitives and the general protocol
+are in
+[troi/docs/ledger.md](https://github.com/thestochasticman/troi/blob/gadi/docs/ledger.md).
+
+### A fill, step by step
+
+```mermaid
+flowchart TD
+    R(["fill(bbox, start, end, products)"]) --> CL["clamp end to today<br/>skip days before the product's first day"]
+    CL --> EN["for each product and 64-day time chunk:<br/>the spatial chunks of the bbox"]
+    EN --> D1{"every day of every chunk<br/>already in the markers?"}
+    D1 -- yes --> NEXT["next time chunk<br/>no claim, no key, no network"]
+    D1 -- no --> C["Claims on every (product, tc, cy, cx)<br/>sorted · lease 600 s · keepalive thread"]
+    C --> D2{"re-diff under the claims"}
+    D2 -- "nothing missing" --> REL
+    D2 -- "days missing" --> F["8 threads: one COG open per day,<br/>one windowed read per chunk<br/>GDAL told not to cache 404s"]
+    F --> T{"per day"}
+    T -- "404" --> ABS["absent marker<br/>day skipped"]
+    T -- "other error" --> HOLD["hold the error"]
+    T -- "data" --> GOT["collect"]
+    ABS --> W
+    HOLD --> W
+    GOT --> W["per touched chunk:<br/>read the 64-day block · set the days ·<br/>write it back · OR the days into the marker"]
+    W --> REL["release the claims"]
+    REL --> RAISE{"held errors?"}
+    RAISE -- yes --> X["raise, after the good days were written"]
+    RAISE -- no --> NEXT
+```
+
+### What `gaps()` can say
+
+`gaps(bbox, start, end, products)` enumerates the same (product, day,
+chunk) cells a fill would and classifies every one not in the markers.
+It touches no network.
+
+| status | for a (product, day, chunk) cell |
+|---|---|
+| `before_product_start` | the day predates the product's first publication; never requested |
+| `after_today` | the day is in the future; never requested |
+| `absent_upstream` | the last fill was told 404 for that day, `age_days` ago; the next fill asks again |
+| `claimed_in_progress` | another job holds that block's claim right now |
+| `never_fetched` | nothing is known; this is the one that should be 0 after a fill |
+
 ## Products
 
 | key | upstream | units | from |
